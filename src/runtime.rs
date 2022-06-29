@@ -20,10 +20,10 @@ struct Executor {
 }
 
 impl Executor {
-    fn run(&mut self) {
+    fn run(&mut self, sender: SyncSender<Arc<Task>>) {
         while let Ok(task) = self.receiver.recv() {
             unsafe {
-                (task.vtab.poll)(task.raw.raw);
+                (task.vtab.poll)(task.raw.raw, &sender, task.clone());
             }
         }
     }
@@ -61,10 +61,10 @@ impl ArcWake for Task {
 }
 
 struct VTable {
-    poll: unsafe fn(NonNull<()>),
+    poll: unsafe fn(NonNull<()>, sender: &SyncSender<NonNull<()>>, task: Arc<Task>),
 }
 
-unsafe fn poll<T>(ptr: NonNull<()>, sender: &SyncSender<NonNull<()>>, task: Arc<Task>)
+unsafe fn poll<T>(ptr: NonNull<()>, sender: &Sender<NonNull<()>>, task: Arc<Task>)
 where
     T: Send + 'static,
 {
