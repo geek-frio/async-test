@@ -1,9 +1,7 @@
 use std::{
     marker::PhantomData,
-    mem::ManuallyDrop,
-    ops::Deref,
-    ptr::NonNull,
     sync::{
+        atomic::{AtomicPtr, Ordering},
         mpsc::{Receiver, SyncSender},
         Arc,
     },
@@ -21,12 +19,16 @@ pub struct Executor {
 }
 
 impl Executor {
-    pub fn run(&mut self, sender: SyncSender<Arc<Task>>) {
-        while let Ok(task) = self.receiver.recv() {
-            unsafe {
-                (task.vtab.poll)(task.raw.raw, task.clone());
+    pub fn run(self) {
+        let receiver = self.receiver;
+        std::thread::spawn(move || {
+            while let Ok(task) = receiver.recv() {
+                println!("Has found a new task!");
+                unsafe {
+                    (task.vtab.poll)(task.raw.load(Ordering::Relaxed), task.clone());
+                }
             }
-        }
+        });
     }
 }
 
@@ -44,9 +46,7 @@ impl Spawner {
             rx: recv,
             marker: PhantomData::<T>,
         };
-        let raw = NonNullWrapper::new(
-            NonNull::new(Box::into_raw(Box::new(fut.boxed())) as *mut ()).unwrap(),
-        );
+        let raw = AtomicPtr::new(Box::into_raw(Box::new(fut.boxed())) as *mut ());
         let vtab = VTable { poll: poll::<T> };
 
         let task = Task {
@@ -60,62 +60,44 @@ impl Spawner {
     }
 }
 
-struct NonNullWrapper {
-    raw: NonNull<()>,
-}
-
-impl NonNullWrapper {
-    fn new(ptr: NonNull<()>) -> NonNullWrapper {
-        NonNullWrapper { raw: ptr }
-    }
-}
-
-impl Deref for NonNullWrapper {
-    type Target = NonNull<()>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.raw
-    }
-}
-
-unsafe impl Send for NonNullWrapper {}
-unsafe impl Sync for NonNullWrapper {}
-
 pub(crate) struct Task {
-    raw: NonNullWrapper,
+    raw: AtomicPtr<()>,
     vtab: VTable,
     task_sender: SyncSender<Arc<Task>>,
-    res_sender: SyncSender<NonNullWrapper>,
+    res_sender: SyncSender<AtomicPtr<()>>,
 }
 
 impl ArcWake for Task {
     fn wake_by_ref(arc_self: &Arc<Self>) {
-        let _ = arc_self.task_sender.send(arc_self.clone());
+        let r = arc_self.task_sender.send(arc_self.clone());
+        println!("wake send result is:{:?}", r);
     }
 }
 
 struct VTable {
-    poll: unsafe fn(NonNull<()>, task: Arc<Task>),
+    poll: unsafe fn(*mut (), task: Arc<Task>),
 }
 
-unsafe fn poll<T>(ptr: NonNull<()>, task: Arc<Task>)
+unsafe fn poll<T>(ptr: *mut (), task: Arc<Task>)
 where
     T: Send + 'static,
 {
-    let mut future = *Box::from_raw(ptr.as_ptr() as *mut BoxFuture<T>);
+    let mut future = *Box::from_raw(ptr as *mut BoxFuture<T>);
     let wf = waker_ref(&task);
     let mut ctx = Context::from_waker(&*wf);
     let res = future.as_mut().poll(&mut ctx);
     if let std::task::Poll::Ready(t) = res {
-        let _ = task.res_sender.send(NonNullWrapper::new(
-            NonNull::new(Box::into_raw(Box::new(t)) as *mut ()).unwrap(),
-        ));
+        let _ = task
+            .res_sender
+            .send(AtomicPtr::new(Box::into_raw(Box::new(t)) as *mut ()));
+    } else {
+        let ptr = Box::into_raw(Box::new(future));
+        task.raw.store(ptr as *mut (), Ordering::Relaxed);
     }
-    let _ = ManuallyDrop::new(future);
 }
 
 pub struct Handle<T> {
-    rx: Receiver<NonNullWrapper>,
+    rx: Receiver<AtomicPtr<()>>,
     marker: PhantomData<T>,
 }
 
@@ -124,7 +106,7 @@ impl<T> Handle<T> {
         unsafe {
             let result = self.rx.recv();
             result
-                .map(|ptr| *Box::from_raw(ptr.as_ptr() as *mut T))
+                .map(|ptr| *Box::from_raw(ptr.load(Ordering::Relaxed) as *mut T))
                 .map_err(|_e| anyhow::Error::msg("sss"))
         }
     }
